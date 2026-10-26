@@ -1,0 +1,380 @@
+<!DOCTYPE html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
+<title>ALS NetBattle — Web greybox</title>
+<style>
+  html,body{margin:0;height:100%;background:#0e1018;color:#c8d0e0;font-family:system-ui,sans-serif;display:flex;flex-direction:column;align-items:center}
+  h1{font-size:16px;font-weight:600;margin:12px 0 4px}
+  .hint{font-size:12px;opacity:.75;margin-bottom:8px;text-align:center;max-width:960px}
+  canvas{background:#141822;border:1px solid #2a3144;border-radius:6px;image-rendering:pixelated;max-width:100%}
+  kbd{background:#22283a;border:1px solid #3a4258;border-radius:3px;padding:1px 5px;font-size:11px}
+</style>
+</head>
+<body>
+<h1>ALS NetBattle · BN-inspired web greybox（自用／原創名）</h1>
+<p class="hint">
+  Custom：<kbd>1</kbd>–<kbd>5</kbd> 選 chip（同 code 或 <kbd>*</kbd> 可 link）→ <kbd>Enter</kbd> 開戰<br/>
+  Battle：<kbd>WASD</kbd> 走格 · <kbd>X</kbd> buster · <kbd>Space</kbd> 出 chip · gauge 滿按 <kbd>C</kbd> 再開 Custom
+</p>
+<canvas id="c" width="960" height="540" tabindex="0"></canvas>
+<script>
+(() => {
+  const canvas = document.getElementById('c');
+  const ctx = canvas.getContext('2d');
+  canvas.focus();
+
+  const COLS = 6, ROWS = 3;
+  const CELL = { x: 88, y: 72 };
+  const ORIGIN = { x: 180, y: 140 };
+  const Op = { DAMAGE_ROW: 0, DAMAGE_AHEAD: 1, HEAL: 2, PANEL_STEAL: 3 };
+
+  const POOL = {
+    pulse_a: { id:'pulse_a', name:'PulseShot', code:'A', op:Op.DAMAGE_ROW, power:40, color:'#66bfff' },
+    pulse_b: { id:'pulse_b', name:'PulseShot', code:'B', op:Op.DAMAGE_ROW, power:40, color:'#66bfff' },
+    pulse_c: { id:'pulse_c', name:'PulseShot', code:'C', op:Op.DAMAGE_ROW, power:40, color:'#66bfff' },
+    blade_s: { id:'blade_s', name:'BladeCut', code:'S', op:Op.DAMAGE_AHEAD, power:80, color:'#f2d84d' },
+    blade_s2:{ id:'blade_s2',name:'BladeCut', code:'S', op:Op.DAMAGE_AHEAD, power:80, color:'#f2d84d' },
+    heal_r:  { id:'heal_r',  name:'HealPulse', code:'*', op:Op.HEAL, power:30, color:'#66f280' },
+    steal_a: { id:'steal_a', name:'PanelSteal', code:'A', op:Op.PANEL_STEAL, power:0, color:'#b366f2' },
+    heavy_g: { id:'heavy_g', name:'HeavyBolt', code:'G', op:Op.DAMAGE_ROW, power:100, color:'#ff7340' },
+  };
+  // Build 30-chip recipe
+  const recipeIds = [
+    ...Array(5).fill('pulse_a'), ...Array(5).fill('pulse_b'), ...Array(4).fill('pulse_c'),
+    ...Array(5).fill('blade_s'), ...Array(3).fill('blade_s2'),
+    ...Array(3).fill('heal_r'), ...Array(2).fill('steal_a'), ...Array(3).fill('heavy_g'),
+  ];
+
+  function shuffle(a, rng) {
+    for (let i = a.length - 1; i > 0; i--) {
+      const j = rng.int(0, i);
+      [a[i], a[j]] = [a[j], a[i]];
+    }
+    return a;
+  }
+  function mulberry32(a) {
+    return function() {
+      let t = a += 0x6D2B79F5;
+      t = Math.imul(t ^ t >>> 15, t | 1);
+      t ^= t + Math.imul(t ^ t >>> 7, t | 61);
+      return ((t ^ t >>> 14) >>> 0) / 4294967296;
+    };
+  }
+  class Rng {
+    constructor(seed) { this._r = mulberry32(seed >>> 0); }
+    next() { return this._r(); }
+    int(lo, hi) { return lo + Math.floor(this.next() * (hi - lo + 1)); }
+  }
+
+  const Phase = { CUSTOM:0, BATTLE:1, WIN:2, LOSE:3 };
+  const state = {
+    phase: Phase.CUSTOM,
+    rng: new Rng(Date.now()),
+    owner: [],
+    player: { x:1, y:1, hp:200, max:200 },
+    enemy:  { x:4, y:1, hp:200, max:200 },
+    folder: [],
+    discard: [],
+    hand: [],
+    selected: [],
+    queue: [],
+    moveCd: 0, busterCd: 0, enemyT: 0, gauge: 0,
+    toast: '', toastT: 0,
+    projectiles: [],
+  };
+
+  function initGrid() {
+    state.owner = [];
+    for (let c = 0; c < COLS; c++) {
+      const col = [];
+      for (let r = 0; r < ROWS; r++) col.push(c < 3 ? 0 : 1);
+      state.owner.push(col);
+    }
+  }
+  function makeFolder() {
+    const f = recipeIds.map(id => ({ ...POOL[id] }));
+    return shuffle(f, state.rng);
+  }
+  function drawHand() {
+    state.hand = [];
+    while (state.hand.length < 5) {
+      if (!state.folder.length) {
+        if (!state.discard.length) break;
+        state.folder = shuffle(state.discard.splice(0), state.rng);
+      }
+      state.hand.push(state.folder.pop());
+    }
+  }
+  function openCustom(first) {
+    state.phase = Phase.CUSTOM;
+    state.gauge = 0;
+    state.selected = [];
+    drawHand();
+    if (first) toast('CUSTOM: 1–5 select · Enter OK · same code = link');
+  }
+  function toast(msg) { state.toast = msg; state.toastT = 1.4; }
+  function inBounds(p) { return p.x >= 0 && p.x < COLS && p.y >= 0 && p.y < ROWS; }
+  function findPos(side) {
+    for (let c = 0; c < COLS; c++) for (let r = 0; r < ROWS; r++)
+      if (state.owner[c][r] === side) return { x:c, y:r };
+    return side === 0 ? { x:1,y:1 } : { x:4,y:1 };
+  }
+  function restart() {
+    state.player.hp = state.player.max;
+    state.enemy.hp = state.enemy.max;
+    state.player.x = 1; state.player.y = 1;
+    state.enemy.x = 4; state.enemy.y = 1;
+    state.projectiles = [];
+    state.queue = [];
+    state.discard = [];
+    initGrid();
+    state.folder = makeFolder();
+    openCustom(true);
+  }
+
+  function toggleSelect(idx) {
+    if (idx < 0 || idx >= state.hand.length) return;
+    const i = state.selected.indexOf(idx);
+    if (i >= 0) { state.selected.splice(i, 1); return; }
+    if (!state.selected.length) { state.selected.push(idx); return; }
+    const last = state.hand[state.selected[state.selected.length - 1]].code;
+    const code = state.hand[idx].code;
+    if (code === '*' || last === '*' || code === last) state.selected.push(idx);
+    else toast('Need same code (or *) to link');
+  }
+  function confirmCustom() {
+    state.queue = [];
+    const taken = new Set(state.selected);
+    for (const i of state.selected) state.queue.push(state.hand[i]);
+    for (let i = 0; i < state.hand.length; i++) if (!taken.has(i)) state.discard.push(state.hand[i]);
+    state.hand = [];
+    state.selected = [];
+    state.phase = Phase.BATTLE;
+    state.enemyT = 0.8;
+    toast('BATTLE · WASD · X buster · Space chip · C custom');
+  }
+
+  function tryMove(dx, dy) {
+    if (state.moveCd > 0) return;
+    const nx = state.player.x + dx, ny = state.player.y + dy;
+    if (!inBounds({x:nx,y:ny})) return;
+    if (state.owner[nx][ny] !== 0) return;
+    state.player.x = nx; state.player.y = ny;
+    state.moveCd = 0.12;
+  }
+  function fireBuster() {
+    if (state.busterCd > 0) return;
+    state.busterCd = 0.22;
+    state.projectiles.push({ kind:'buster', row: state.player.y, col: state.player.x + 0.5, speed:14, power:3, fromPlayer:true });
+  }
+  function fireChip() {
+    if (!state.queue.length) { toast('No chips — wait gauge + C'); return; }
+    const chip = state.queue.shift();
+    state.discard.push(chip);
+    resolveChip(chip, true);
+  }
+  function hurtEnemy(n) {
+    state.enemy.hp = Math.max(0, state.enemy.hp - n);
+    if (state.enemy.hp <= 0) { state.phase = Phase.WIN; toast('YOU WIN — Enter restart'); }
+  }
+  function hurtPlayer(n) {
+    state.player.hp = Math.max(0, state.player.hp - n);
+    if (state.player.hp <= 0) { state.phase = Phase.LOSE; toast('DELETED — Enter restart'); }
+  }
+  function frontEnemyCol() {
+    for (let c = 3; c < COLS; c++) for (let r = 0; r < ROWS; r++) if (state.owner[c][r] === 1) return c;
+    return -1;
+  }
+  function resolveChip(chip, fromPlayer) {
+    if (chip.op === Op.DAMAGE_ROW) {
+      state.projectiles.push({
+        kind:'row', row: fromPlayer ? state.player.y : state.enemy.y,
+        col: fromPlayer ? state.player.x + 1 : state.enemy.x - 1,
+        speed: fromPlayer ? 10 : -10, power: chip.power, fromPlayer, color: chip.color
+      });
+      toast(chip.name);
+    } else if (chip.op === Op.DAMAGE_AHEAD) {
+      let hit = false;
+      if (fromPlayer) {
+        hit = state.enemy.y === state.player.y && state.enemy.x === state.player.x + 1;
+        if (hit) hurtEnemy(chip.power);
+      } else {
+        hit = state.player.y === state.enemy.y && state.player.x === state.enemy.x - 1;
+        if (hit) hurtPlayer(chip.power);
+      }
+      toast(hit ? chip.name + '!' : chip.name + ' (miss)');
+    } else if (chip.op === Op.HEAL) {
+      if (fromPlayer) state.player.hp = Math.min(state.player.max, state.player.hp + chip.power);
+      else state.enemy.hp = Math.min(state.enemy.max, state.enemy.hp + chip.power);
+      toast(chip.name + ' +' + chip.power);
+    } else if (chip.op === Op.PANEL_STEAL) {
+      const c = frontEnemyCol();
+      if (c >= 0) {
+        for (let r = 0; r < ROWS; r++) state.owner[c][r] = 0;
+        toast('PanelSteal col ' + c);
+        if (state.owner[state.enemy.x][state.enemy.y] !== 1) {
+          const p = findPos(1); state.enemy.x = p.x; state.enemy.y = p.y;
+        }
+      }
+    }
+  }
+  function enemyAct() {
+    if (state.phase !== Phase.BATTLE) return;
+    const dirs = [[1,0],[-1,0],[0,1],[0,-1],[0,0]];
+    const [dx,dy] = dirs[state.rng.int(0, dirs.length - 1)];
+    const nx = state.enemy.x + dx, ny = state.enemy.y + dy;
+    if (inBounds({x:nx,y:ny}) && state.owner[nx][ny] === 1) { state.enemy.x = nx; state.enemy.y = ny; }
+    if (state.rng.next() < 0.55) {
+      state.projectiles.push({ kind:'buster', row: state.enemy.y, col: state.enemy.x - 0.5, speed:-12, power:8, fromPlayer:false });
+    }
+  }
+  function updateProjectiles(dt) {
+    const next = [];
+    for (const p of state.projectiles) {
+      p.col += p.speed * dt;
+      let hit = false;
+      if (p.fromPlayer) {
+        if (Math.round(p.row) === state.enemy.y && p.col >= state.enemy.x - 0.35) { hurtEnemy(p.power); hit = true; }
+      } else {
+        if (Math.round(p.row) === state.player.y && p.col <= state.player.x + 0.35) { hurtPlayer(p.power); hit = true; }
+      }
+      if (!hit && p.col > -1 && p.col < COLS + 1) next.push(p);
+    }
+    state.projectiles = next;
+  }
+
+  function onKey(e) {
+    const k = e.key;
+    if (state.phase === Phase.WIN || state.phase === Phase.LOSE) {
+      if (k === 'Enter') restart();
+      e.preventDefault(); return;
+    }
+    if (state.phase === Phase.CUSTOM) {
+      if (k >= '1' && k <= '5') toggleSelect(+k - 1);
+      else if (k === 'Enter') confirmCustom();
+      e.preventDefault(); return;
+    }
+    if ((k === 'c' || k === 'C') && state.gauge >= 1) { openCustom(false); e.preventDefault(); return; }
+    if (k === 'w' || k === 'W' || k === 'ArrowUp') tryMove(0, -1);
+    else if (k === 's' || k === 'S' || k === 'ArrowDown') tryMove(0, 1);
+    else if (k === 'a' || k === 'A' || k === 'ArrowLeft') tryMove(-1, 0);
+    else if (k === 'd' || k === 'D' || k === 'ArrowRight') tryMove(1, 0);
+    else if (k === 'x' || k === 'X' || k === 'z' || k === 'Z') fireBuster();
+    else if (k === ' ') fireChip();
+    e.preventDefault();
+  }
+  window.addEventListener('keydown', onKey);
+  canvas.addEventListener('click', () => canvas.focus());
+
+  function cellRect(c, r) {
+    return { x: ORIGIN.x + c * CELL.x, y: ORIGIN.y + r * CELL.y, w: CELL.x - 4, h: CELL.y - 4 };
+  }
+  function draw() {
+    ctx.fillStyle = '#141822';
+    ctx.fillRect(0, 0, 960, 540);
+    for (let c = 0; c < COLS; c++) for (let r = 0; r < ROWS; r++) {
+      const rect = cellRect(c, r);
+      ctx.fillStyle = state.owner[c][r] === 0 ? '#2659b3' : '#a62e38';
+      ctx.fillRect(rect.x, rect.y, rect.w, rect.h);
+      ctx.strokeStyle = 'rgba(255,255,255,0.15)';
+      ctx.strokeRect(rect.x, rect.y, rect.w, rect.h);
+    }
+    function actor(p, color, label) {
+      const rect = cellRect(p.x, p.y);
+      ctx.fillStyle = color;
+      ctx.fillRect(rect.x + 14, rect.y + 14, rect.w - 28, rect.h - 28);
+      ctx.fillStyle = '#000';
+      ctx.font = '18px system-ui';
+      ctx.fillText(label, rect.x + 32, rect.y + 42);
+    }
+    actor(state.player, '#59e6ff', 'P');
+    actor(state.enemy, '#ff7366', 'E');
+    for (const p of state.projectiles) {
+      ctx.fillStyle = p.color || '#ffe699';
+      ctx.fillRect(ORIGIN.x + p.col * CELL.x + 28, ORIGIN.y + p.row * CELL.y + 28, 24, 16);
+    }
+    ctx.fillStyle = '#99f0ff';
+    ctx.font = '22px system-ui';
+    ctx.fillText('HP ' + state.player.hp, 24, 36);
+    ctx.fillStyle = '#ff8c80';
+    ctx.fillText('HP ' + state.enemy.hp, 780, 36);
+    ctx.fillStyle = '#333842';
+    ctx.fillRect(360, 28, 240, 14);
+    ctx.fillStyle = '#f2d933';
+    ctx.fillRect(360, 28, 240 * state.gauge, 14);
+    ctx.fillStyle = '#e6e6b3';
+    ctx.font = '12px system-ui';
+    ctx.fillText('CUSTOM', 360, 24);
+    ctx.fillStyle = '#e6e6d9';
+    ctx.font = '16px system-ui';
+    const q = state.queue.length ? state.queue.map(c => c.name + c.code).join(' > ') : '(empty)';
+    ctx.fillText('Queue: ' + q, 24, 64);
+    ctx.fillStyle = '#808899';
+    ctx.font = '14px system-ui';
+    ctx.fillText('ALS NetBattle · BN-inspired greybox · own creative use', 24, 520);
+    if (state.toastT > 0) {
+      ctx.fillStyle = '#ffffbf';
+      ctx.font = '20px system-ui';
+      ctx.fillText(state.toast, 300, 100);
+    }
+    if (state.phase === Phase.CUSTOM) {
+      ctx.fillStyle = 'rgba(8,10,16,0.92)';
+      ctx.fillRect(80, 360, 800, 150);
+      ctx.fillStyle = '#d9e6ff';
+      ctx.font = '16px system-ui';
+      ctx.fillText('CUSTOM SCREEN — pick chips (same code links). Enter to fight.', 100, 390);
+      state.hand.forEach((chip, i) => {
+        const x = 100 + i * 150;
+        const sel = state.selected.includes(i);
+        ctx.fillStyle = sel ? '#597333' : '#334059';
+        ctx.fillRect(x, 410, 130, 80);
+        ctx.strokeStyle = chip.color;
+        ctx.lineWidth = 3;
+        ctx.strokeRect(x, 410, 130, 80);
+        ctx.lineWidth = 1;
+        ctx.fillStyle = '#fff';
+        ctx.font = '14px system-ui';
+        ctx.fillText('[' + (i + 1) + '] ' + chip.code, x + 8, 435);
+        ctx.fillText(chip.name, x + 8, 460);
+        ctx.fillStyle = '#b3bfcc';
+        ctx.font = '12px system-ui';
+        ctx.fillText('pwr ' + chip.power, x + 8, 480);
+      });
+    } else if (state.phase === Phase.WIN) {
+      ctx.fillStyle = '#80ff99';
+      ctx.font = '36px system-ui';
+      ctx.fillText('YOU WIN', 380, 260);
+    } else if (state.phase === Phase.LOSE) {
+      ctx.fillStyle = '#ff6666';
+      ctx.font = '36px system-ui';
+      ctx.fillText('DELETED', 380, 260);
+    }
+  }
+
+  let last = performance.now();
+  function frame(now) {
+    const dt = Math.min(0.05, (now - last) / 1000);
+    last = now;
+    state.moveCd = Math.max(0, state.moveCd - dt);
+    state.busterCd = Math.max(0, state.busterCd - dt);
+    if (state.toastT > 0) state.toastT -= dt;
+    updateProjectiles(dt);
+    if (state.phase === Phase.BATTLE) {
+      state.gauge = Math.min(1, state.gauge + dt * 0.12);
+      state.enemyT -= dt;
+      if (state.enemyT <= 0) { enemyAct(); state.enemyT = 0.55 + state.rng.next() * 0.4; }
+    }
+    draw();
+    requestAnimationFrame(frame);
+  }
+
+  initGrid();
+  state.folder = makeFolder();
+  openCustom(true);
+  requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>
